@@ -967,6 +967,19 @@ class GnomeBackend:
                 out.append(self.get(p, "name"))
         return out
 
+    empty_binding = "''"
+
+    def disable_conflicts(self, b):
+        """Tira a tecla dos outros atalhos (o atalho continua existindo, só sem tecla)."""
+        want = self.binding_value(b).lower()
+        for item in self.entries():
+            p = self.path_of(item)
+            v = self.get(p, "binding")
+            vals = v if isinstance(v, list) else [v]
+            if self.get(p, "name") != SHORTCUT_NAME and want in [str(x).lower() for x in vals]:
+                self.setk(p, "binding", self.empty_binding)
+        return True
+
     def bind(self, b, command):
         if not have("gsettings"):
             return False
@@ -979,6 +992,9 @@ class GnomeBackend:
             item = self.item_of(i)
             lst.append(item)
         p = self.path_of(item)
+        # Limpa a tecla antes de gravar: força o GNOME a reservá-la de novo (se antes
+        # ela estava ocupada por outro atalho, ele não tenta sozinho).
+        self.setk(p, "binding", self.empty_binding)
         ok_ = (self.setk(p, "name", SHORTCUT_NAME) and self.setk(p, self.cmd_key, command)
                and self.setk(p, "binding", self.binding_value(b)))
         self.set_entries(lst)
@@ -1006,6 +1022,8 @@ class CinnamonBackend(GnomeBackend):
 
     def item_of(self, i):
         return "custom%d" % i
+
+    empty_binding = "[]"
 
     def binding_value(self, b):
         return str([fmt_gtk(b)])
@@ -1200,7 +1218,13 @@ def apply_binding(b, de=None):
     others = be.conflicts(b)
     if others:
         warn(t("Essa tecla já está em uso por: ", "That key is already used by: ") + ", ".join(map(str, others)))
-        if not ask_yes(t("Criar o atalho mesmo assim?", "Create the shortcut anyway?"), False):
+        if hasattr(be, "disable_conflicts"):
+            # Duas regras na mesma tecla não funcionam: o ambiente só reserva a tecla para uma.
+            if not ask_yes(t("Tirar a tecla desse atalho e usá-la para o %s?",
+                             "Remove the key from that shortcut and use it for %s?") % SHORTCUT_NAME):
+                return False
+            be.disable_conflicts(b)
+        elif not ask_yes(t("Criar o atalho mesmo assim?", "Create the shortcut anyway?"), False):
             return False
     if be.bind(b, cmd):
         ok(t("Atalho criado no %s: %s → abrir o painel", "Shortcut created in %s: %s → open the panel")
