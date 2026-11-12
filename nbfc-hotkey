@@ -1,0 +1,1437 @@
+#!/usr/bin/env python3
+# nbfc-hotkey — instala o NBFC-Linux, configura o controle das ventoinhas e
+# liga uma tecla do notebook (ex.: NitroSense, Omen, Armoury...) ao painel.
+#
+# Licença MIT. https://github.com/medeirosszg/nbfc-hotkey
+
+import argparse
+import ast
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.0"
+APP = "nbfc-hotkey"
+SHORTCUT_NAME = "NBFC Hotkey"
+
+HOME = os.path.expanduser("~")
+BIN_DIR = os.path.join(HOME, ".local", "bin")
+LIB_DIR = os.path.join(HOME, ".local", "lib", APP)
+SHIM_DIR = os.path.join(LIB_DIR, "bin")
+INSTALLED_SELF = os.path.join(BIN_DIR, APP)
+CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), APP)
+CONF_FILE = os.path.join(CONF_DIR, "config.json")
+HWDB_FILE = "/etc/udev/hwdb.d/90-nbfc-hotkey.hwdb"
+NBFC_REPO = "nbfc-linux/nbfc-linux"
+NBFC_QT_REPO = "nbfc-linux/nbfc-qt"
+
+DRY_RUN = False
+ASSUME_YES = False
+
+# --------------------------------------------------------------------------
+# Idioma e saída
+# --------------------------------------------------------------------------
+
+_lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").lower()
+PT = _lang.startswith("pt")
+
+
+def t(pt, en):
+    return pt if PT else en
+
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if _COLOR else s
+
+
+def info(msg):
+    print(_c("1;34", "::") + " " + msg)
+
+
+def ok(msg):
+    print(_c("1;32", "✓") + " " + msg)
+
+
+def warn(msg):
+    print(_c("1;33", "!") + " " + msg, file=sys.stderr)
+
+
+def err(msg):
+    print(_c("1;31", "✗") + " " + msg, file=sys.stderr)
+
+
+def die(msg, code=1):
+    err(msg)
+    sys.exit(code)
+
+
+def ask_yes(question, default=True):
+    if ASSUME_YES:
+        return default
+    hint = t("[S/n]", "[Y/n]") if default else t("[s/N]", "[y/N]")
+    while True:
+        try:
+            ans = input("%s %s " % (question, hint)).strip().lower()
+        except EOFError:
+            return default
+        if not ans:
+            return default
+        if ans[0] in "sy":
+            return True
+        if ans[0] == "n":
+            return False
+
+
+def ask_choice(question, options, default=0):
+    """Mostra uma lista numerada e devolve o índice escolhido."""
+    if ASSUME_YES:
+        return default
+    print(question)
+    for i, opt in enumerate(options, 1):
+        mark = _c("1", " (padrão)" if PT else " (default)") if i - 1 == default else ""
+        print("  %d) %s%s" % (i, opt, mark))
+    while True:
+        try:
+            ans = input("> ").strip()
+        except EOFError:
+            return default
+        if not ans:
+            return default
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return int(ans) - 1
+
+
+def ask_text(question, default=""):
+    if ASSUME_YES:
+        return default
+    try:
+        ans = input("%s%s: " % (question, " [%s]" % default if default else "")).strip()
+    except EOFError:
+        return default
+    return ans or default
+
+
+# --------------------------------------------------------------------------
+# Execução de comandos
+# --------------------------------------------------------------------------
+
+def run(cmd, root=False, capture=True, check=False, env=None, cwd=None):
+    """Roda um comando. root=True usa sudo (se ainda não formos root)."""
+    if root and os.geteuid() != 0:
+        cmd = ["sudo"] + list(cmd)
+    if DRY_RUN and (root or cmd[0] in ("apt-get", "dnf", "zypper", "pacman")):
+        print(_c("2", "[dry-run] " + " ".join(shlex.quote(c) for c in cmd)))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
+                           stderr=subprocess.PIPE if capture else None,
+                           universal_newlines=True, env=env, cwd=cwd)
+    except FileNotFoundError:
+        r = subprocess.CompletedProcess(cmd, 127, "", "%s: not found" % cmd[0])
+    if check and r.returncode != 0:
+        die(t("Comando falhou: ", "Command failed: ") + " ".join(cmd) +
+            ("\n" + (r.stderr or "").strip() if capture else ""))
+    return r
+
+
+def have(prog):
+    return shutil.which(prog) is not None
+
+
+def sudo_warmup():
+    """Pede a senha do sudo uma vez, antes de começar."""
+    if os.geteuid() == 0 or DRY_RUN:
+        return True
+    if not have("sudo"):
+        die(t("sudo não encontrado. Rode como um usuário com sudo.",
+              "sudo not found. Run as a user with sudo."))
+    return subprocess.call(["sudo", "-v"]) == 0
+
+
+def notify(title, body="", icon="dialog-information"):
+    if have("notify-send"):
+        subprocess.call(["notify-send", "-a", "NBFC", "-i", icon, title, body],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------------
+# Configuração do nbfc-hotkey
+# --------------------------------------------------------------------------
+
+def load_config():
+    try:
+        with open(CONF_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = CONF_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONF_FILE)
+
+
+# --------------------------------------------------------------------------
+# Detecção de sistema
+# --------------------------------------------------------------------------
+
+def os_release():
+    d = {}
+    for p in ("/etc/os-release", "/usr/lib/os-release"):
+        try:
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        d[k] = v.strip().strip('"').strip("'")
+            break
+        except OSError:
+            continue
+    return d
+
+
+def distro_family(osr):
+    did = osr.get("ID", "").lower()
+    like = osr.get("ID_LIKE", "").lower().split()
+    ids = [did] + like
+    if did in ("arch", "manjaro", "endeavouros", "cachyos", "garuda", "artix") or "arch" in like:
+        return "arch"
+    if did == "linuxmint":
+        return "mint" if "ubuntu" in like else "debian"   # LMDE é baseado no Debian
+    if did == "ubuntu" or "ubuntu" in like:
+        return "ubuntu"
+    if "debian" in ids:
+        return "debian"
+    if did == "fedora" or "fedora" in like:
+        return "fedora"
+    if any(i.startswith("opensuse") or i == "suse" for i in ids):
+        return "opensuse"
+    return "other"
+
+
+def read_dmi(name):
+    try:
+        with open("/sys/class/dmi/id/" + name) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def desktop_env():
+    raw = (os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or "").lower()
+    parts = re.split(r"[:;]", raw)
+    for p in parts:
+        if "cinnamon" in p:
+            return "cinnamon"
+        if p == "mate":
+            return "mate"
+        if "xfce" in p:
+            return "xfce"
+        if p in ("kde", "plasma"):
+            return "kde"
+        if p == "sway":
+            return "sway"
+        if p == "hyprland":
+            return "hyprland"
+        if p == "i3":
+            return "i3"
+    for p in parts:
+        if p in ("gnome", "unity", "budgie", "budgie-desktop", "pantheon", "ubuntu", "gnome-classic", "pop", "cosmic"):
+            return "gnome" if p != "cosmic" else "cosmic"
+    if os.environ.get("SWAYSOCK"):
+        return "sway"
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    return "unknown"
+
+
+DE_NAMES = {
+    "gnome": "GNOME", "cinnamon": "Cinnamon", "mate": "MATE", "xfce": "XFCE",
+    "kde": "KDE Plasma", "sway": "Sway", "i3": "i3", "hyprland": "Hyprland",
+    "cosmic": "COSMIC", "unknown": t("desconhecido", "unknown"),
+}
+
+
+def has_systemd():
+    return os.path.isdir("/run/systemd/system")
+
+
+def nbfc_version():
+    if not have("nbfc"):
+        return None
+    r = run(["nbfc", "--version"])
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", r.stdout + r.stderr)
+    return m.group(1) if m else "?"
+
+
+def nbfc_selected_config():
+    try:
+        with open("/etc/nbfc/nbfc.json") as f:
+            return json.load(f).get("SelectedConfigId")
+    except (OSError, ValueError):
+        return None
+
+
+def nbfc_service_ok():
+    return have("nbfc") and run(["nbfc", "status"]).returncode == 0
+
+
+# --------------------------------------------------------------------------
+# Download dos pacotes do NBFC-Linux (GitHub Releases)
+# --------------------------------------------------------------------------
+
+def http_get(url, accept=None):
+    req = urllib.request.Request(url, headers={"User-Agent": APP + "/" + VERSION})
+    if accept:
+        req.add_header("Accept", accept)
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == 3:
+                raise
+        except (urllib.error.URLError, OSError):
+            if attempt == 3:
+                raise
+        time.sleep(2 * (attempt + 1))     # o GitHub às vezes responde 5xx; tenta de novo
+
+
+def latest_release(repo):
+    data = http_get("https://api.github.com/repos/%s/releases/latest" % repo,
+                    "application/vnd.github+json")
+    return json.loads(data.decode())
+
+
+def download_asset(asset, dest_dir):
+    path = os.path.join(dest_dir, asset["name"])
+    info(t("Baixando ", "Downloading ") + asset["name"])
+    data = http_get(asset["browser_download_url"])
+    digest = asset.get("digest") or ""
+    if digest.startswith("sha256:"):
+        if hashlib.sha256(data).hexdigest() != digest.split(":", 1)[1]:
+            die(t("O arquivo baixado não bate com o checksum do GitHub: ",
+                  "Downloaded file does not match GitHub checksum: ") + asset["name"])
+        ok(t("Checksum SHA-256 conferido", "SHA-256 checksum verified"))
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _find(assets, prefix, suffix=""):
+    for a in assets:
+        if a["name"].startswith(prefix) and a["name"].endswith(suffix):
+            return a
+    return None
+
+
+def pick_nbfc_asset(assets, fam, osr):
+    import platform
+    if platform.machine() not in ("x86_64", "amd64"):
+        return None
+    ver = osr.get("VERSION_ID", "")
+    if fam == "arch":
+        return _find(assets, "arch-linux-", ".pkg.tar.zst")
+    if fam == "fedora":
+        return _find(assets, "fedora-%s-" % ver.split(".")[0], ".rpm")
+    if fam == "opensuse":
+        return _find(assets, "opensuse-", ".rpm")
+    if fam == "mint":
+        return _find(assets, "linux-mint-%s-" % ver.split(".")[0], ".deb")
+    if fam == "ubuntu":
+        code = osr.get("UBUNTU_CODENAME") or osr.get("VERSION_CODENAME", "")
+        return _find(assets, "ubuntu-%s-" % code, ".deb")
+    if fam == "debian":
+        code = osr.get("DEBIAN_CODENAME") or osr.get("VERSION_CODENAME", "")
+        return _find(assets, "debian-%s-" % code, ".deb")
+    return None
+
+
+def pick_nbfc_qt_asset(assets, fam):
+    prefix = {"arch": "arch-linux-", "fedora": "fedora-", "opensuse": "opensuse-",
+              "debian": "debian-", "ubuntu": "debian-", "mint": "debian-"}.get(fam)
+    return _find(assets, prefix) if prefix else None
+
+
+def install_package_file(path, fam):
+    if fam in ("debian", "ubuntu", "mint"):
+        cmd = ["apt-get", "install", "-y", path]
+    elif fam == "fedora":
+        cmd = ["dnf", "install", "-y", path]
+    elif fam == "opensuse":
+        cmd = ["zypper", "--non-interactive", "install", "--allow-unsigned-rpm", path]
+    elif fam == "arch":
+        cmd = ["pacman", "-U", "--noconfirm", "--needed", path]
+    else:
+        return False
+    if fam in ("debian", "ubuntu", "mint"):
+        run(["apt-get", "update"], root=True, capture=False)
+    if run(cmd, root=True, capture=False).returncode == 0:
+        return True
+    if fam == "arch":
+        warn(t("Dica: atualize o sistema antes (sudo pacman -Syu) e rode de novo.",
+               "Hint: update your system first (sudo pacman -Syu) and try again."))
+    return False
+
+
+BUILD_DEPS = {
+    "fedora": ["dnf", "install", "-y", "gcc", "make", "autoconf", "automake", "pkgconf-pkg-config",
+               "libcurl-devel", "openssl-devel", "libxml2-devel", "lua-devel", "gawk"],
+    "opensuse": ["zypper", "--non-interactive", "install", "gcc", "make", "autoconf", "automake",
+                 "pkg-config", "libcurl-devel", "libopenssl-devel", "libxml2-devel", "lua54-devel", "gawk"],
+    "debian": ["apt-get", "install", "-y", "build-essential", "autoconf", "automake", "pkg-config",
+               "libcurl4-openssl-dev", "libssl-dev", "libxml2-dev", "liblua5.4-dev", "gawk"],
+    "arch": ["pacman", "-S", "--needed", "--noconfirm", "base-devel", "curl", "openssl", "libxml2", "lua", "gawk"],
+}
+BUILD_DEPS["ubuntu"] = BUILD_DEPS["mint"] = BUILD_DEPS["debian"]
+
+
+def nbfc_works():
+    return have("nbfc") and run(["nbfc", "--version"]).returncode == 0
+
+
+def build_nbfc_from_source(tag, fam):
+    info(t("Compilando o NBFC-Linux a partir do código-fonte...", "Building NBFC-Linux from source..."))
+    deps = BUILD_DEPS.get(fam)
+    if deps:
+        info(t("Instalando as dependências de compilação", "Installing build dependencies"))
+        if run(deps, root=True, capture=False).returncode != 0:
+            die(t("Não consegui instalar as dependências de compilação.", "Could not install build dependencies."))
+    else:
+        need = [p for p in ("gcc", "make", "autoconf", "automake", "pkg-config") if not have(p)]
+        if need:
+            die(t("Instale antes: ", "Please install first: ") + " ".join(need) +
+                t(" e as bibliotecas de desenvolvimento de libcurl, openssl, libxml2 e lua.",
+                  " plus the development headers for libcurl, openssl, libxml2 and lua."))
+    work = tempfile.mkdtemp(prefix=APP + "-src-")
+    tgz = os.path.join(work, "src.tar.gz")
+    with open(tgz, "wb") as f:
+        f.write(http_get("https://github.com/%s/archive/refs/tags/%s.tar.gz" % (NBFC_REPO, tag)))
+    with tarfile.open(tgz) as tf:
+        if hasattr(tarfile, "data_filter"):
+            tf.extractall(work, filter="data")
+        else:
+            tf.extractall(work)
+    src = [d for d in glob.glob(os.path.join(work, "nbfc-linux-*")) if os.path.isdir(d)][0]
+    conf = ["./configure", "--prefix=/usr", "--sysconfdir=/etc"]
+    if not (has_systemd() or have("systemctl")):
+        conf.append("--with-init-system=openrc" if have("openrc") else "--with-init-system=systemv")
+    for step in (["./autogen.sh"], conf, ["make", "-j%d" % (os.cpu_count() or 2)]):
+        if run(step, cwd=src, capture=False).returncode != 0:
+            die(t("A compilação falhou em: ", "Build failed at: ") + " ".join(step))
+    if run(["make", "install"], root=True, cwd=src, capture=False).returncode != 0:
+        die(t("make install falhou", "make install failed"))
+    return True
+
+
+def install_nbfc(fam, osr, force=False):
+    if have("nbfc") and not force:
+        ok(t("NBFC-Linux já instalado (versão %s)", "NBFC-Linux already installed (version %s)") % nbfc_version())
+    else:
+        rel = latest_release(NBFC_REPO)
+        asset = pick_nbfc_asset(rel["assets"], fam, osr)
+        if asset:
+            with tempfile.TemporaryDirectory(prefix=APP + "-") as d:
+                if not install_package_file(download_asset(asset, d), fam):
+                    die(t("Falha ao instalar o pacote do NBFC-Linux.", "Failed to install the NBFC-Linux package."))
+            if not nbfc_works() and not DRY_RUN:
+                # Ex.: o pacote oficial do openSUSE às vezes é compilado contra bibliotecas antigas
+                warn(t("O pacote oficial instalou, mas o `nbfc` não roda nesta versão da distro. "
+                       "Vou trocá-lo por uma compilação local.",
+                       "The official package installed but `nbfc` does not run on this distro version. "
+                       "Replacing it with a local build."))
+                pkg = "nbfc-linux-git" if fam == "arch" else "nbfc-linux"
+                remove = {"arch": ["pacman", "-R", "--noconfirm", pkg],
+                          "fedora": ["dnf", "remove", "-y", pkg],
+                          "opensuse": ["zypper", "--non-interactive", "remove", pkg]}.get(
+                    fam, ["apt-get", "remove", "-y", pkg])
+                run(remove, root=True, capture=False)
+                build_nbfc_from_source(rel["tag_name"], fam)
+        else:
+            info(t("Não há pacote pronto para esta distro.", "No prebuilt package for this distro."))
+            build_nbfc_from_source(rel["tag_name"], fam)
+        if not nbfc_works() and not DRY_RUN:
+            die(t("O NBFC-Linux foi instalado, mas o comando `nbfc` não funciona.",
+                  "NBFC-Linux was installed but the `nbfc` command does not work."))
+        ok(t("NBFC-Linux instalado", "NBFC-Linux installed"))
+
+    if have("nbfc-qt") and not force:
+        ok(t("Painel nbfc-qt já instalado", "nbfc-qt panel already installed"))
+        return
+    rel = latest_release(NBFC_QT_REPO)
+    asset = pick_nbfc_qt_asset(rel["assets"], fam)
+    if not asset:
+        warn(t("Não há pacote do painel nbfc-qt para esta distro. Instale manualmente: "
+               "https://github.com/nbfc-linux/nbfc-qt (a tecla pode rodar outro comando).",
+               "No nbfc-qt package for this distro. Install it manually: "
+               "https://github.com/nbfc-linux/nbfc-qt (the key can run another command)."))
+        return
+    with tempfile.TemporaryDirectory(prefix=APP + "-") as d:
+        if install_package_file(download_asset(asset, d), fam):
+            ok(t("Painel nbfc-qt instalado", "nbfc-qt panel installed"))
+        else:
+            warn(t("Falha ao instalar o nbfc-qt.", "Failed to install nbfc-qt."))
+
+
+# --------------------------------------------------------------------------
+# Configuração do NBFC para o modelo do notebook
+# --------------------------------------------------------------------------
+
+def configure_nbfc(reconfigure=False):
+    current = nbfc_selected_config()
+    if current and nbfc_service_ok() and not reconfigure:
+        ok(t("NBFC já configurado (\"%s\") e serviço rodando", "NBFC already configured (\"%s\") and running") % current)
+        return True
+
+    model = read_dmi("product_name")
+    info(t("Procurando configuração para: ", "Looking for a config for: ") + (model or "?"))
+    run(["nbfc", "update"], root=True)   # baixa as configurações mais recentes
+
+    r = run(["nbfc", "config", "--set", "auto"], root=True)
+    if r.returncode == 0:
+        ok(t("Configuração escolhida automaticamente", "Config selected automatically"))
+    else:
+        rec = [l.strip() for l in run(["nbfc", "config", "--recommend"]).stdout.splitlines() if l.strip()]
+        if not rec:
+            warn(t("Nenhuma configuração reconhece este notebook. Veja `nbfc config --list` e "
+                   "https://github.com/nbfc-linux/nbfc-linux#getting-started-without-the-gui",
+                   "No config matches this laptop. See `nbfc config --list` and "
+                   "https://github.com/nbfc-linux/nbfc-linux#getting-started-without-the-gui"))
+            return False
+        i = ask_choice(t("Configurações que podem servir no seu notebook:",
+                         "Configs that may work on your laptop:"), rec[:15])
+        if run(["nbfc", "config", "--set", rec[i]], root=True).returncode != 0:
+            warn(t("Não consegui aplicar a configuração.", "Could not apply the config."))
+            return False
+        ok(t("Configuração aplicada: ", "Config applied: ") + rec[i])
+
+    if has_systemd():
+        run(["systemctl", "enable", "nbfc_service"], root=True)
+    run(["nbfc", "restart"], root=True)
+    for _ in range(10):
+        if nbfc_service_ok():
+            ok(t("Serviço do NBFC rodando e ligado no boot", "NBFC service running and enabled at boot"))
+            return True
+        time.sleep(1)
+    warn(t("O serviço do NBFC não iniciou. Causas comuns: Secure Boot bloqueando o acesso ao "
+           "controlador (instale o módulo acpi_ec) ou configuração errada. Log:",
+           "The NBFC service did not start. Common causes: Secure Boot blocking EC access "
+           "(install the acpi_ec module) or a wrong config. Log:"))
+    print(run(["journalctl", "-u", "nbfc_service", "-n", "15", "--no-pager"], root=True).stdout)
+    return False
+
+
+# --------------------------------------------------------------------------
+# Arquivos do usuário: o próprio script e o "nbfc intermediário"
+# --------------------------------------------------------------------------
+
+SHIM = """#!/bin/sh
+# Criado pelo nbfc-hotkey. Usado só pelo painel nbfc-qt.
+# Quando o driver NVIDIA está instalado mas não carregado (ex.: kernel novo sem
+# o módulo compilado), o `nbfc` espera o sensor da NVIDIA para sempre e o painel
+# trava antes de abrir. Aqui ele desiste depois de alguns segundos.
+REAL="${NBFC_HOTKEY_REAL_PATH:-/usr/local/bin:/usr/bin:/bin}"
+case "$1" in
+    complete-sensors|sensors)
+        timeout 4 /usr/bin/env PATH="$REAL" nbfc "$@" 2>/dev/null
+        rc=$?
+        [ "$rc" -eq 124 ] && exit 0
+        exit "$rc" ;;
+    *)
+        PATH="$REAL" exec nbfc "$@" ;;
+esac
+"""
+
+
+def install_user_files():
+    os.makedirs(BIN_DIR, exist_ok=True)
+    os.makedirs(SHIM_DIR, exist_ok=True)
+    me = os.path.realpath(sys.argv[0])
+    if me != os.path.realpath(INSTALLED_SELF):
+        shutil.copyfile(me, INSTALLED_SELF)
+    os.chmod(INSTALLED_SELF, 0o755)
+    shim = os.path.join(SHIM_DIR, "nbfc")
+    with open(shim, "w") as f:
+        f.write(SHIM)
+    os.chmod(shim, 0o755)
+    ok(t("Instalado em ", "Installed to ") + INSTALLED_SELF)
+    if BIN_DIR not in os.environ.get("PATH", "").split(":"):
+        warn(t("%s não está no seu PATH; use o caminho completo para rodar o %s.",
+               "%s is not in your PATH; use the full path to run %s.") % (BIN_DIR, APP))
+
+
+def trigger_command():
+    return INSTALLED_SELF + " trigger"
+
+
+# --------------------------------------------------------------------------
+# Ação da tecla (subcomando "trigger", chamado pelo atalho)
+# --------------------------------------------------------------------------
+
+def find_panel_pids():
+    pids = []
+    uid = os.getuid()
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            if os.stat(d).st_uid != uid:
+                continue
+            with open(d + "/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if any(os.path.basename(a) == b"nbfc-qt" for a in args[:2]):
+            pids.append(int(os.path.basename(d)))
+    return pids
+
+
+def _dbg(msg):
+    if os.environ.get("NBFC_HOTKEY_DEBUG"):
+        print("[trigger] " + msg, file=sys.stderr)
+
+
+def cmd_trigger(_args=None):
+    cfg = load_config()
+    stamp = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), APP + ".last")
+    now = time.time()
+    try:
+        with open(stamp) as f:
+            if now - float(f.read() or 0) < 1.5:
+                _dbg("ignorado (toque repetido)")
+                return 0          # toque repetido: o painel ainda está abrindo
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(stamp, "w") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+
+    if cfg.get("action", "panel") == "command" and cfg.get("command"):
+        subprocess.Popen(cfg["command"], shell=True, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+
+    pids = find_panel_pids()
+    _dbg("painéis abertos: %s" % pids)
+    if pids:                      # já aberto: a tecla fecha
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        return 0
+
+    env = dict(os.environ)
+    env["NBFC_HOTKEY_REAL_PATH"] = env.get("PATH", "/usr/bin:/bin")
+    env["PATH"] = SHIM_DIR + ":" + env["NBFC_HOTKEY_REAL_PATH"]
+    try:
+        subprocess.Popen(["nbfc-qt", "--fans"], env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        notify("NBFC", t("O painel nbfc-qt não está instalado.", "The nbfc-qt panel is not installed."),
+               "dialog-error")
+        return 1
+    if not nbfc_service_ok():
+        notify("NBFC", t("O serviço nbfc_service não está rodando.", "nbfc_service is not running."),
+               "dialog-warning")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Leitura da tecla direto do kernel (/dev/input, precisa de root)
+# --------------------------------------------------------------------------
+
+EV_KEY, EV_MSC, MSC_SCAN = 1, 4, 4
+EVENT = struct.Struct("llHHi")
+MODIFIERS = {29: "ctrl", 97: "ctrl", 42: "shift", 54: "shift", 56: "alt", 100: "alt",
+             125: "super", 126: "super"}
+
+# Código evdev -> nome do keysym (XKB). Cobre as teclas que fazem sentido como atalho.
+KEYSYMS = {
+    1: "Escape", 2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
+    12: "minus", 13: "equal", 14: "BackSpace", 15: "Tab", 28: "Return", 57: "space",
+    16: "q", 17: "w", 18: "e", 19: "r", 20: "t", 21: "y", 22: "u", 23: "i", 24: "o", 25: "p",
+    30: "a", 31: "s", 32: "d", 33: "f", 34: "g", 35: "h", 36: "j", 37: "k", 38: "l",
+    44: "z", 45: "x", 46: "c", 47: "v", 48: "b", 49: "n", 50: "m",
+    59: "F1", 60: "F2", 61: "F3", 62: "F4", 63: "F5", 64: "F6", 65: "F7", 66: "F8",
+    67: "F9", 68: "F10", 87: "F11", 88: "F12",
+    183: "F13", 184: "F14", 185: "F15", 186: "F16", 187: "F17", 188: "F18",
+    189: "F19", 190: "F20", 191: "F21", 192: "F22", 193: "F23", 194: "F24",
+    70: "Scroll_Lock", 99: "Print", 102: "Home", 103: "Up", 104: "Prior", 105: "Left",
+    106: "Right", 107: "End", 108: "Down", 109: "Next", 110: "Insert", 111: "Delete",
+    119: "Pause", 127: "Menu", 139: "Menu",
+    140: "XF86Calculator", 144: "XF86Explorer", 148: "XF86Launch1", 149: "XF86Launch2",
+    150: "XF86WWW", 155: "XF86Mail", 156: "XF86Favorites", 157: "XF86MyComputer",
+    171: "XF86Tools", 172: "XF86HomePage", 202: "XF86Launch3", 203: "XF86Launch4",
+    217: "XF86Search",
+}
+# Teclas que o sistema já usa (volume, brilho...). Melhor não sequestrar.
+RESERVED = {113, 114, 115, 163, 164, 165, 166, 224, 225, 227, 238}
+REMAP_TARGETS = [("prog3", 202), ("prog4", 203), ("prog2", 149)]
+
+
+def capture_key_root(timeout):
+    """Roda como root. Espera uma tecla e imprime JSON com código, scancode e dispositivo."""
+    fds = {}
+    for dev in sorted(glob.glob("/dev/input/event*")):
+        base = "/sys/class/input/%s/device" % os.path.basename(dev)
+        try:
+            with open(base + "/capabilities/ev") as f:
+                if not int(f.read().strip(), 16) & (1 << EV_KEY):
+                    continue
+            with open(base + "/name") as f:
+                name = f.read().strip()
+            fds[os.open(dev, os.O_RDONLY | os.O_NONBLOCK)] = name
+        except (OSError, ValueError):
+            continue
+    mods, scans = set(), {}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ready, _, _ = select.select(list(fds), [], [], max(0.05, deadline - time.time()))
+        for fd in ready:
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except OSError:
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, typ, code, value = EVENT.unpack_from(data, off)
+                if typ == EV_MSC and code == MSC_SCAN:
+                    scans[fd] = value & 0xFFFFFFFF
+                elif typ == EV_KEY:
+                    if code in MODIFIERS:
+                        (mods.add if value else mods.discard)(MODIFIERS[code])
+                    elif value == 1 and not (0x100 <= code < 0x160):   # ignora botões de mouse
+                        print(json.dumps({"code": code, "scan": scans.get(fd), "device": fds[fd],
+                                          "mods": sorted(mods)}))
+                        return 0
+    print(json.dumps(None))
+    return 0
+
+
+def capture_key(timeout=20):
+    if not sudo_warmup():
+        die(t("Preciso do sudo para ler o teclado.", "sudo is needed to read the keyboard."))
+    print()
+    print(_c("1;36", t("  >>> Aperte a tecla (ou combinação) que vai abrir o painel. <<<",
+                       "  >>> Press the key (or combination) that will open the panel. <<<")))
+    print(t("      Você tem %d segundos.", "      You have %d seconds.") % timeout)
+    cmd = [sys.executable, "-I", os.path.realpath(sys.argv[0]), "_capture", "--timeout", str(timeout)]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def code_label(code):
+    return KEYSYMS.get(code, t("código %d", "code %d") % code)
+
+
+def remap_key(scan, device, target):
+    """Cria uma regra no hwdb do udev para trocar o código de uma tecla."""
+    entry = "evdev:name:%s:*\n KEYBOARD_KEY_%x=%s\n" % (device, scan, target)
+    content = ""
+    try:
+        with open(HWDB_FILE) as f:
+            content = f.read()
+    except OSError:
+        content = "# Gerado pelo nbfc-hotkey. Remova este arquivo para desfazer.\n"
+    content = re.sub(r"evdev:name:%s:\*\n KEYBOARD_KEY_%x=\S+\n" % (re.escape(device), scan), "", content)
+    content += entry
+    p = subprocess.run((["sudo"] if os.geteuid() else []) + ["tee", HWDB_FILE],
+                       input=content, stdout=subprocess.DEVNULL, universal_newlines=True)
+    if p.returncode != 0:
+        return False
+    run(["systemd-hwdb", "update"], root=True)
+    run(["udevadm", "trigger", "--subsystem-match=input", "--action=change"], root=True)
+    time.sleep(1.5)
+    return True
+
+
+def choose_key():
+    """Fluxo interativo: descobre a tecla e devolve {"keysym", "mods"}."""
+    while True:
+        k = capture_key()
+        if k is None:
+            warn(t("Nenhuma tecla chegou ao sistema.", "No key reached the system."))
+            print(t("  Algumas teclas especiais (NitroSense, Armoury, Omen...) só funcionam com o driver\n"
+                    "  do fabricante carregado (acer_wmi, asus_wmi, hp_wmi...). Você pode tentar de novo,\n"
+                    "  usar outra tecla/combinação, ou digitar o nome do keysym manualmente.",
+                    "  Some special keys (NitroSense, Armoury, Omen...) only work when the vendor driver\n"
+                    "  is loaded (acer_wmi, asus_wmi, hp_wmi...). You can retry, use another key/combo,\n"
+                    "  or type the keysym name manually."))
+            i = ask_choice(t("O que fazer?", "What now?"),
+                           [t("Tentar de novo", "Try again"), t("Digitar o keysym (ex.: XF86Launch1)",
+                                                                "Type the keysym (e.g. XF86Launch1)"),
+                            t("Cancelar", "Cancel")])
+            if i == 0:
+                continue
+            if i == 1:
+                return parse_binding(ask_text("Keysym"))
+            return None
+
+        code, mods = k["code"], norm_mods(k["mods"])
+        info(t("Tecla detectada: %s (dispositivo \"%s\")", "Key detected: %s (device \"%s\")")
+             % (code_label(code), k["device"]))
+        if code in RESERVED:
+            warn(t("Essa tecla já tem função no sistema (volume, brilho...).",
+                   "That key already has a system function (volume, brightness...)."))
+            if not ask_yes(t("Usar mesmo assim?", "Use it anyway?"), False):
+                continue
+        if code not in KEYSYMS:
+            if k.get("scan") is None:
+                warn(t("O sistema não tem nome para essa tecla e não dá para remapeá-la. Escolha outra.",
+                       "The system has no name for this key and it cannot be remapped. Pick another."))
+                continue
+            used = {code}
+            target = next((tg for tg in REMAP_TARGETS if tg[1] not in used), REMAP_TARGETS[0])
+            print(t("  Essa tecla não tem um nome que o ambiente gráfico entenda. Posso remapeá-la\n"
+                    "  para %s (regra do udev em %s).",
+                    "  This key has no name the desktop understands. I can remap it to\n"
+                    "  %s (udev rule in %s).") % (KEYSYMS[target[1]], HWDB_FILE))
+            if not ask_yes(t("Remapear?", "Remap?")):
+                continue
+            if not remap_key(k["scan"], k["device"], target[0]):
+                warn(t("Falha ao remapear.", "Remap failed."))
+                continue
+            ok(t("Remapeada. Aperte a tecla de novo para confirmar.", "Remapped. Press the key again to confirm."))
+            k2 = capture_key(15)
+            if not k2 or k2["code"] != target[1]:
+                warn(t("O remapeamento não funcionou para essa tecla.", "The remap did not work for this key."))
+                continue
+            code, mods = target[1], norm_mods(k2["mods"])
+        b = {"keysym": KEYSYMS[code], "mods": mods}
+        if not mods and len(b["keysym"]) == 1:
+            warn(t("Uma letra sem Ctrl/Alt/Super atrapalharia a digitação. Use uma combinação.",
+                   "A plain letter would break typing. Use a combination."))
+            continue
+        ok(t("Atalho: ", "Shortcut: ") + format_human(b))
+        return b
+
+
+def parse_binding(text):
+    """Aceita 'XF86Launch1', 'ctrl+alt+f' ou '<Control><Alt>f'."""
+    text = text.strip()
+    if not text:
+        return None
+    mods = []
+    alias = {"control": "ctrl", "ctrl": "ctrl", "primary": "ctrl", "alt": "alt", "mod1": "alt",
+             "super": "super", "mod4": "super", "meta": "super", "win": "super", "shift": "shift"}
+    for m in re.findall(r"<([^>]+)>", text):
+        if m.lower() in alias:
+            mods.append(alias[m.lower()])
+    text = re.sub(r"<[^>]+>", "", text)
+    parts = text.split("+")
+    for p in parts[:-1]:
+        if p.strip().lower() in alias:
+            mods.append(alias[p.strip().lower()])
+    key = parts[-1].strip()
+    if len(key) == 1:
+        key = key.lower()
+    return {"keysym": key, "mods": norm_mods(mods)}
+
+
+MOD_ORDER = ["ctrl", "alt", "shift", "super"]
+
+
+def norm_mods(mods):
+    return sorted(set(mods), key=MOD_ORDER.index)
+
+
+def format_human(b):
+    names = {"ctrl": "Ctrl", "alt": "Alt", "super": "Super", "shift": "Shift"}
+    return "+".join([names[m] for m in b["mods"]] + [b["keysym"]])
+
+
+# --------------------------------------------------------------------------
+# Atalhos em cada ambiente gráfico
+# --------------------------------------------------------------------------
+
+def fmt_gtk(b, ctrl="<Control>", sup="<Super>"):
+    m = {"ctrl": ctrl, "alt": "<Alt>", "super": sup, "shift": "<Shift>"}
+    return "".join(m[x] for x in b["mods"]) + b["keysym"]
+
+
+QT_KEYS = {"XF86Launch1": "Launch (3)", "XF86Launch2": "Launch (4)", "XF86Launch3": "Launch (5)",
+           "XF86Launch4": "Launch (6)", "XF86Tools": "Tools", "XF86Calculator": "Calculator",
+           "XF86MyComputer": "Launch (0)", "XF86Explorer": "Explorer", "XF86WWW": "WWW",
+           "XF86Mail": "Launch Mail", "XF86Favorites": "Favorites", "XF86HomePage": "Home Page",
+           "XF86Search": "Search", "Prior": "PgUp", "Next": "PgDown", "Delete": "Del",
+           "Insert": "Ins", "Escape": "Esc", "Return": "Return", "Scroll_Lock": "ScrollLock",
+           "BackSpace": "Backspace", "space": "Space", "minus": "-", "equal": "="}
+
+
+def fmt_qt(b):
+    m = {"ctrl": "Ctrl", "alt": "Alt", "super": "Meta", "shift": "Shift"}
+    key = QT_KEYS.get(b["keysym"], b["keysym"].upper() if len(b["keysym"]) == 1 else b["keysym"])
+    return "+".join([m[x] for x in b["mods"]] + [key])
+
+
+def fmt_sway(b):
+    m = {"ctrl": "Ctrl", "alt": "Mod1", "super": "Mod4", "shift": "Shift"}
+    return "+".join([m[x] for x in b["mods"]] + [b["keysym"]])
+
+
+def fmt_hypr(b):
+    m = {"ctrl": "CTRL", "alt": "ALT", "super": "SUPER", "shift": "SHIFT"}
+    return "%s, %s" % (" ".join(m[x] for x in b["mods"]), b["keysym"])
+
+
+def gsettings(*args):
+    return run(["gsettings"] + list(args))
+
+
+def _gvariant_list(s):
+    s = s.strip()
+    if s.startswith("@as"):
+        s = s[3:].strip()
+    try:
+        return list(ast.literal_eval(s))
+    except (ValueError, SyntaxError):
+        return []
+
+
+class GnomeBackend:
+    """GNOME, Ubuntu, Budgie, Pantheon, Pop (gsd media-keys)."""
+    schema = "org.gnome.settings-daemon.plugins.media-keys"
+    key = "custom-keybindings"
+    rschema = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
+    base = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+    cmd_key = "command"
+
+    def entry(self, i):
+        return self.base + "custom%d/" % i
+
+    def entries(self):
+        return _gvariant_list(gsettings("get", self.schema, self.key).stdout)
+
+    def set_entries(self, lst):
+        gsettings("set", self.schema, self.key, str(lst))
+
+    def get(self, path, k):
+        v = gsettings("get", "%s:%s" % (self.rschema, path), k).stdout.strip()
+        try:
+            return ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            return v
+
+    def setk(self, path, k, v):
+        return gsettings("set", "%s:%s" % (self.rschema, path), k, v).returncode == 0
+
+    def path_of(self, item):
+        return item
+
+    def item_of(self, i):
+        return self.entry(i)
+
+    def binding_value(self, b):
+        return fmt_gtk(b)
+
+    def find_ours(self):
+        for item in self.entries():
+            if self.get(self.path_of(item), "name") == SHORTCUT_NAME:
+                return item
+        return None
+
+    def conflicts(self, b):
+        want = self.binding_value(b).lower()
+        out = []
+        for item in self.entries():
+            p = self.path_of(item)
+            v = self.get(p, "binding")
+            vals = v if isinstance(v, list) else [v]
+            if self.get(p, "name") != SHORTCUT_NAME and want in [str(x).lower() for x in vals]:
+                out.append(self.get(p, "name"))
+        return out
+
+    def bind(self, b, command):
+        if not have("gsettings"):
+            return False
+        lst = self.entries()
+        item = self.find_ours()
+        if item is None:
+            i = 0
+            while self.item_of(i) in lst:
+                i += 1
+            item = self.item_of(i)
+            lst.append(item)
+        p = self.path_of(item)
+        ok_ = (self.setk(p, "name", SHORTCUT_NAME) and self.setk(p, self.cmd_key, command)
+               and self.setk(p, "binding", self.binding_value(b)))
+        self.set_entries(lst)
+        return ok_
+
+    def unbind(self):
+        item = self.find_ours()
+        if item is None:
+            return True
+        p = self.path_of(item)
+        for k in ("name", self.cmd_key, "binding"):
+            gsettings("reset", "%s:%s" % (self.rschema, p), k)
+        self.set_entries([x for x in self.entries() if x != item])
+        return True
+
+
+class CinnamonBackend(GnomeBackend):
+    schema = "org.cinnamon.desktop.keybindings"
+    key = "custom-list"
+    rschema = "org.cinnamon.desktop.keybindings.custom-keybinding"
+    base = "/org/cinnamon/desktop/keybindings/custom-keybindings/"
+
+    def path_of(self, item):
+        return self.base + item + "/"
+
+    def item_of(self, i):
+        return "custom%d" % i
+
+    def binding_value(self, b):
+        return str([fmt_gtk(b)])
+
+
+class MateBackend(GnomeBackend):
+    rschema = "org.mate.control-center.keybinding"
+    base = "/org/mate/desktop/keybindings/"
+    cmd_key = "action"
+
+    def entries(self):
+        return [x.rstrip("/") for x in run(["dconf", "list", self.base]).stdout.split() if x.endswith("/")]
+
+    def set_entries(self, lst):
+        pass
+
+    def path_of(self, item):
+        return self.base + item + "/"
+
+    def item_of(self, i):
+        return "custom%d" % i
+
+    def binding_value(self, b):
+        return fmt_gtk(b, sup="<Mod4>")
+
+    def unbind(self):
+        item = self.find_ours()
+        if item:
+            run(["dconf", "reset", "-f", self.path_of(item)])
+        return True
+
+
+class XfceBackend:
+    channel = "xfce4-keyboard-shortcuts"
+
+    def _ours(self):
+        r = run(["xfconf-query", "-c", self.channel, "-l", "-v"])
+        out = []
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[0].startswith("/commands/custom/") and APP + " trigger" in parts[1]:
+                out.append(parts[0])
+        return out
+
+    def conflicts(self, b):
+        prop = "/commands/custom/" + fmt_gtk(b, ctrl="<Primary>")
+        r = run(["xfconf-query", "-c", self.channel, "-p", prop])
+        return [r.stdout.strip()] if r.returncode == 0 and APP not in r.stdout else []
+
+    def bind(self, b, command):
+        self.unbind()
+        prop = "/commands/custom/" + fmt_gtk(b, ctrl="<Primary>")
+        return run(["xfconf-query", "-c", self.channel, "-p", prop, "-n", "-t", "string",
+                    "-s", command]).returncode == 0
+
+    def unbind(self):
+        for p in self._ours():
+            run(["xfconf-query", "-c", self.channel, "-p", p, "-r"])
+        return True
+
+
+class KdeBackend:
+    desktop_id = APP + ".desktop"
+
+    def _desktop_path(self):
+        return os.path.join(HOME, ".local", "share", "applications", self.desktop_id)
+
+    def _kwrite(self):
+        return shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")
+
+    def conflicts(self, b):
+        return []
+
+    def _reload(self):
+        if run(["systemctl", "--user", "restart", "plasma-kglobalaccel.service"]).returncode != 0:
+            run(["kquitapp5", "kglobalaccel"])
+            if have("kglobalaccel5"):
+                subprocess.Popen(["kglobalaccel5"], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def bind(self, b, command):
+        kw = self._kwrite()
+        if not kw:
+            return False
+        os.makedirs(os.path.dirname(self._desktop_path()), exist_ok=True)
+        with open(self._desktop_path(), "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nIcon=weather-windy\n"
+                    "NoDisplay=true\nX-KDE-GlobalAccel-CommandShortcut=true\n" % (SHORTCUT_NAME, command))
+        r = run([kw, "--file", "kglobalshortcutsrc", "--group", "services", "--group", self.desktop_id,
+                 "--key", "_launch", fmt_qt(b)])
+        self._reload()
+        return r.returncode == 0
+
+    def unbind(self):
+        kw = self._kwrite()
+        if kw:
+            run([kw, "--file", "kglobalshortcutsrc", "--group", "services", "--group", self.desktop_id,
+                 "--key", "_launch", "--delete"])
+        try:
+            os.remove(self._desktop_path())
+        except OSError:
+            pass
+        self._reload()
+        return True
+
+
+class ConfigFileBackend:
+    """Sway, i3 e Hyprland: acrescenta um bloco marcado no arquivo de configuração."""
+    BEGIN, END = "# >>> nbfc-hotkey >>>", "# <<< nbfc-hotkey <<<"
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def path(self):
+        cands = {"sway": ["~/.config/sway/config"],
+                 "i3": ["~/.config/i3/config", "~/.i3/config"],
+                 "hyprland": ["~/.config/hypr/hyprland.conf"]}[self.kind]
+        for c in cands:
+            if os.path.exists(os.path.expanduser(c)):
+                return os.path.expanduser(c)
+        return os.path.expanduser(cands[0])
+
+    def line(self, b, command):
+        if self.kind == "hyprland":
+            return "bind = %s, exec, %s" % (fmt_hypr(b), command)
+        return "bindsym %s exec %s" % (fmt_sway(b), command)
+
+    def conflicts(self, b):
+        return []
+
+    def _strip(self, text):
+        return re.sub(r"\n?%s.*?%s\n?" % (re.escape(self.BEGIN), re.escape(self.END)), "\n", text, flags=re.S)
+
+    def bind(self, b, command):
+        p = self.path()
+        try:
+            with open(p) as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        text = self._strip(text).rstrip("\n") + "\n\n%s\n%s\n%s\n" % (self.BEGIN, self.line(b, command), self.END)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+        self._reload()
+        return True
+
+    def unbind(self):
+        p = self.path()
+        try:
+            with open(p) as f:
+                text = f.read()
+        except OSError:
+            return True
+        with open(p, "w") as f:
+            f.write(self._strip(text))
+        self._reload()
+        return True
+
+    def _reload(self):
+        if self.kind == "sway":
+            run(["swaymsg", "reload"])
+        elif self.kind == "i3":
+            run(["i3-msg", "reload"])
+        # Hyprland recarrega sozinho quando o arquivo muda
+
+
+def backend_for(de):
+    if de in ("sway", "i3", "hyprland"):
+        return ConfigFileBackend(de)
+    cls = {"gnome": GnomeBackend, "cinnamon": CinnamonBackend, "mate": MateBackend,
+           "xfce": XfceBackend, "kde": KdeBackend}.get(de)
+    return cls() if cls else None
+
+
+def manual_instructions(b, command):
+    print(t("  Crie um atalho de teclado personalizado no seu ambiente gráfico com:",
+            "  Create a custom keyboard shortcut in your desktop with:"))
+    print("    %s %s" % (t("Tecla:  ", "Key:    "), format_human(b) if b else "?"))
+    print("    %s %s" % (t("Comando:", "Command:"), command))
+
+
+def apply_binding(b, de=None):
+    de = de or desktop_env()
+    be = backend_for(de)
+    cmd = trigger_command()
+    if be is None:
+        warn(t("Não sei criar atalhos no ambiente \"%s\" automaticamente.",
+               "I don't know how to create shortcuts in \"%s\" automatically.") % DE_NAMES.get(de, de))
+        manual_instructions(b, cmd)
+        return False
+    others = be.conflicts(b)
+    if others:
+        warn(t("Essa tecla já está em uso por: ", "That key is already used by: ") + ", ".join(map(str, others)))
+        if not ask_yes(t("Criar o atalho mesmo assim?", "Create the shortcut anyway?"), False):
+            return False
+    if be.bind(b, cmd):
+        ok(t("Atalho criado no %s: %s → abrir o painel", "Shortcut created in %s: %s → open the panel")
+           % (DE_NAMES.get(de, de), format_human(b)))
+        if de == "kde":
+            print(t("  (Suporte ao KDE é experimental. Se não funcionar, confira em Configurações → Atalhos.)",
+                    "  (KDE support is experimental. If it doesn't work, check Settings → Shortcuts.)"))
+        cfg = load_config()
+        cfg["binding"], cfg["desktop"] = b, de
+        save_config(cfg)
+        return True
+    warn(t("Não consegui criar o atalho.", "Could not create the shortcut."))
+    manual_instructions(b, cmd)
+    return False
+
+
+# --------------------------------------------------------------------------
+# Subcomandos
+# --------------------------------------------------------------------------
+
+def check_not_root():
+    if os.geteuid() == 0 and not os.environ.get("NBFC_HOTKEY_ALLOW_ROOT"):
+        die(t("Rode como seu usuário normal (sem sudo). Eu peço a senha quando precisar.",
+              "Run as your normal user (not with sudo). I'll ask for the password when needed."))
+
+
+def print_status():
+    osr = os_release()
+    de = desktop_env()
+    cfg = load_config()
+    print(_c("1", "%s %s" % (APP, VERSION)))
+    print("  %-10s %s · %s (%s)" % (t("Sistema:", "System:"), osr.get("PRETTY_NAME", "Linux"),
+                                     DE_NAMES.get(de, de), os.environ.get("XDG_SESSION_TYPE", "?")))
+    print("  %-10s %s %s" % (t("Notebook:", "Laptop:"), read_dmi("sys_vendor"), read_dmi("product_name")))
+    v = nbfc_version()
+    if v:
+        st = t("rodando", "running") if nbfc_service_ok() else t("parado", "stopped")
+        print("  %-10s %s, %s, config \"%s\"" % ("NBFC:", v, st, nbfc_selected_config() or "-"))
+    else:
+        print("  %-10s %s" % ("NBFC:", t("não instalado", "not installed")))
+    print("  %-10s %s" % (t("Painel:", "Panel:"), t("instalado", "installed") if have("nbfc-qt")
+                          else t("não instalado", "not installed")))
+    if cfg.get("binding"):
+        act = t("abrir painel", "open panel") if cfg.get("action", "panel") == "panel" else cfg.get("command")
+        print("  %-10s %s → %s" % (t("Tecla:", "Key:"), format_human(cfg["binding"]), act))
+    else:
+        print("  %-10s %s" % (t("Tecla:", "Key:"), t("nenhuma", "none")))
+
+
+def cmd_install(args):
+    if not args.only_packages:
+        check_not_root()
+    osr = os_release()
+    fam = distro_family(osr)
+    print_status()
+    print()
+    info(t("Distro detectada: família \"%s\"", "Detected distro family: \"%s\"") % fam)
+    if not sudo_warmup():
+        die(t("Preciso do sudo para instalar.", "sudo is required to install."))
+    install_nbfc(fam, osr, force=args.reinstall)
+    if args.only_packages:
+        return 0
+    configure_nbfc(reconfigure=args.reconfigure)
+    install_user_files()
+    cfg = load_config()
+    cfg.setdefault("action", "panel")
+    save_config(cfg)
+    if args.no_bind:
+        return 0
+    b = parse_binding(args.key) if args.key else choose_key()
+    if b:
+        apply_binding(b)
+    print()
+    ok(t("Pronto! Aperte a tecla para abrir o painel de ventoinhas.",
+         "Done! Press the key to open the fan panel."))
+    return 0
+
+
+def cmd_bind(args):
+    check_not_root()
+    if not os.path.exists(INSTALLED_SELF):
+        install_user_files()
+    b = parse_binding(args.key) if args.key else choose_key()
+    if not b:
+        return 1
+    return 0 if apply_binding(b) else 1
+
+
+def cmd_unbind(_args):
+    check_not_root()
+    cfg = load_config()
+    be = backend_for(cfg.get("desktop") or desktop_env())
+    if be:
+        be.unbind()
+    cfg.pop("binding", None)
+    save_config(cfg)
+    ok(t("Atalho removido", "Shortcut removed"))
+    return 0
+
+
+def cmd_action(args):
+    cfg = load_config()
+    if args.what:
+        choice = 0 if args.what == "panel" else 1
+        command = args.command
+    else:
+        choice = ask_choice(t("O que a tecla deve fazer?", "What should the key do?"),
+                            [t("Abrir/fechar o painel de ventoinhas (nbfc-qt)", "Open/close the fan panel (nbfc-qt)"),
+                             t("Rodar outro comando", "Run another command")])
+        command = ask_text(t("Comando", "Command"), cfg.get("command", "")) if choice == 1 else None
+    if choice == 1:
+        if not command:
+            die(t("Informe o comando.", "Please give a command."))
+        cfg["action"], cfg["command"] = "command", command
+    else:
+        cfg["action"] = "panel"
+    save_config(cfg)
+    ok(t("Ação salva", "Action saved"))
+    return 0
+
+
+def cmd_uninstall(_args):
+    check_not_root()
+    cmd_unbind(None)
+    if os.path.exists(HWDB_FILE) and ask_yes(t("Remover também o remapeamento de tecla (%s)?",
+                                               "Also remove the key remap (%s)?") % HWDB_FILE):
+        run(["rm", "-f", HWDB_FILE], root=True)
+        run(["systemd-hwdb", "update"], root=True)
+        run(["udevadm", "trigger", "--subsystem-match=input", "--action=change"], root=True)
+    shutil.rmtree(LIB_DIR, ignore_errors=True)
+    shutil.rmtree(CONF_DIR, ignore_errors=True)
+    for p in (INSTALLED_SELF,):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    ok(t("nbfc-hotkey removido. O NBFC-Linux e o nbfc-qt continuam instalados "
+         "(remova pelo gerenciador de pacotes se quiser).",
+         "nbfc-hotkey removed. NBFC-Linux and nbfc-qt are still installed "
+         "(remove them with your package manager if you want)."))
+    return 0
+
+
+def cmd_menu(_args):
+    check_not_root()
+    while True:
+        print()
+        print_status()
+        print()
+        opts = [t("Instalar e configurar tudo", "Install and set up everything"),
+                t("Escolher a tecla", "Choose the key"),
+                t("Escolher o que a tecla faz", "Choose what the key does"),
+                t("Testar (abrir o painel agora)", "Test (open the panel now)"),
+                t("Remover o atalho", "Remove the shortcut"),
+                t("Desinstalar o nbfc-hotkey", "Uninstall nbfc-hotkey"),
+                t("Sair", "Quit")]
+        i = ask_choice(t("O que você quer fazer?", "What do you want to do?"), opts, default=len(opts) - 1)
+        ns = argparse.Namespace(key=None, only_packages=False, reinstall=False, reconfigure=False,
+                                no_bind=False, what=None, command=None)
+        if i == 0:
+            cmd_install(ns)
+        elif i == 1:
+            cmd_bind(ns)
+        elif i == 2:
+            cmd_action(ns)
+        elif i == 3:
+            cmd_trigger()
+        elif i == 4:
+            cmd_unbind(ns)
+        elif i == 5:
+            if ask_yes(t("Tem certeza?", "Are you sure?"), False):
+                return cmd_uninstall(ns)
+        else:
+            return 0
+
+
+def main():
+    global DRY_RUN, ASSUME_YES
+    p = argparse.ArgumentParser(prog=APP, description=t(
+        "Instala o NBFC-Linux e liga uma tecla do notebook ao painel de ventoinhas. "
+        "Sem argumentos, abre um menu.",
+        "Installs NBFC-Linux and binds a laptop key to the fan panel. With no arguments, opens a menu."))
+    p.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
+    p.add_argument("-y", "--yes", action="store_true", help=t("responde sim a tudo", "answer yes to everything"))
+    p.add_argument("--dry-run", action="store_true",
+                   help=t("só mostra os comandos de instalação", "only print install commands"))
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("install", help=t("instala e configura tudo", "install and set up everything"))
+    s.add_argument("--key", help=t("tecla sem detecção (ex.: XF86Launch1, ctrl+alt+f)",
+                                   "key without detection (e.g. XF86Launch1, ctrl+alt+f)"))
+    s.add_argument("--no-bind", action="store_true", help=t("não cria o atalho", "don't create the shortcut"))
+    s.add_argument("--only-packages", action="store_true",
+                   help=t("só instala os pacotes do NBFC", "only install the NBFC packages"))
+    s.add_argument("--reinstall", action="store_true", help=t("reinstala os pacotes", "reinstall packages"))
+    s.add_argument("--reconfigure", action="store_true",
+                   help=t("escolhe a configuração do notebook de novo", "pick the laptop config again"))
+    s.set_defaults(func=cmd_install)
+
+    s = sub.add_parser("bind", help=t("escolhe a tecla", "choose the key"))
+    s.add_argument("--key", help=t("tecla sem detecção", "key without detection"))
+    s.set_defaults(func=cmd_bind)
+
+    s = sub.add_parser("action", help=t("escolhe o que a tecla faz", "choose what the key does"))
+    s.add_argument("what", nargs="?", choices=["panel", "command"])
+    s.add_argument("command", nargs="?")
+    s.set_defaults(func=cmd_action)
+
+    sub.add_parser("status", help=t("mostra o estado", "show status")).set_defaults(
+        func=lambda a: print_status() or 0)
+    sub.add_parser("unbind", help=t("remove o atalho", "remove the shortcut")).set_defaults(func=cmd_unbind)
+    sub.add_parser("uninstall", help=t("desinstala o nbfc-hotkey", "uninstall nbfc-hotkey")).set_defaults(
+        func=cmd_uninstall)
+    sub.add_parser("trigger", help=t("o que o atalho executa", "what the shortcut runs")).set_defaults(
+        func=cmd_trigger)
+    s = sub.add_parser("_capture")
+    s.add_argument("--timeout", type=float, default=20)
+    s.set_defaults(func=lambda a: capture_key_root(a.timeout))
+
+    args = p.parse_args()
+    DRY_RUN, ASSUME_YES = args.dry_run, args.yes
+    if not args.cmd:
+        return cmd_menu(args)
+    try:
+        return args.func(args) or 0
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except urllib.error.URLError as e:
+        die(t("Erro de rede: ", "Network error: ") + str(e))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
