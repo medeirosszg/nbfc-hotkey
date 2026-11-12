@@ -1281,8 +1281,9 @@ def cmd_install(args):
 
 def cmd_bind(args):
     check_not_root()
-    if not os.path.exists(INSTALLED_SELF):
-        install_user_files()
+    if (not os.path.exists(INSTALLED_SELF)
+            or os.path.realpath(sys.argv[0]) != os.path.realpath(INSTALLED_SELF)):
+        install_user_files()      # instala ou atualiza a cópia em ~/.local/bin
     b = parse_binding(args.key) if args.key else choose_key()
     if not b:
         return 1
